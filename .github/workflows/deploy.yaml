@@ -1,0 +1,72 @@
+name: Deploy Backend on AWS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - stg
+      - prod
+
+    paths:
+      - 'infra/**'
+      - '.github/workflows/be-deploy.yml'
+
+jobs:
+  build_image:
+    runs-on: ubuntu-latest
+    name: DEPLOY BACKEND
+    environment:  ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets['AWS_ACCESS_KEY'] }}
+          aws-secret-access-key: ${{ secrets['AWS_SECRET_KEY'] }}
+          aws-region: ap-northeast-1
+
+      - name: Download apple root certificate
+        run: |
+          curl -O https://www.apple.com/certificateauthority/AppleRootCA-G3.cer
+
+      - name: Login to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to AWS ECR backend
+        id: build-image-backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets[format('ECR_REPOSITORY_BACKEND_{0}', github.ref_name)]  }}
+          IMAGE_TAG: ${{ github.sha }}
+          STAGE_NAME: ${{ github.ref_name }}
+        run: |
+          AWS_ID=$(aws sts get-caller-identity --query Account)
+          AWS_ID="${AWS_ID%\"}"
+          AWS_ID="${AWS_ID#\"}"
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --build-arg AWS_ID=$AWS_ID --build-arg STAGE_NAME=$STAGE_NAME -f Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.4.6
+          terraform_wrapper: false
+
+      - name: Deploy ECS by Terraform
+        id: deploy-ecs
+        env:
+          AWS_ACCESS_KEY: ${{ secrets['AWS_ACCESS_KEY'] }}
+          AWS_SECRET_KEY: ${{ secrets['AWS_SECRET_KEY'] }}
+          IMAGE_BE: ${{ steps.build-image-backend.outputs.image }}
+          STAGE_NAME: ${{ github.ref_name }}
+          TERRAFORM_STATE_BUCKET_NAME: ${{ secrets[format('TERRAFORM_STATE_BUCKET_NAME_{0}', github.ref_name)]  }}
+      
+        run: |
+          cd infra/
+          bash update_vars.sh
+          terraform init -backend-config=./cfbackend.tfvars
+          terraform apply -auto-approve
